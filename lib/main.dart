@@ -1,7 +1,5 @@
-// =================================================================
-// 1. استدعاء المكتبات الأساسية للتطبيق
-// =================================================================
 import 'dart:async';
+import 'dart:io';
 import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -10,27 +8,32 @@ import 'package:camera/camera.dart';
 import 'package:google_mlkit_pose_detection/google_mlkit_pose_detection.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-// متغير لحفظ قائمة الكاميرات المتاحة في الموبايل
+// ============================================================================
+// ملخص الإصلاحات في هذا الملف (بالتفصيل في رسالة الشات):
+// 1) تحديد imageFormatGroup صراحة عند تهيئة الكاميرا (nv21 / bgra8888) — هذا
+//    هو سبب عطل الكشف الرئيسي؛ بدونه كانت البيانات الخام (YUV_420_888) تُصنَّف
+//    خطأً على أنها NV21 فتصل صورة مشوّهة إلى MLKit.
+// 2) حساب زاوية دوران الصورة (rotation) ديناميكياً بدل تثبيتها على 270 درجة.
+// 3) رفع دقة النموذج إلى PoseDetectionModel.accurate.
+// 4) اختيار الجانب (يمين/يسار) الأوضح للكاميرا تلقائياً، وتجاهل أي نقطة بثقة
+//    منخفضة، وتنعيم القراءات، ووضع فاصل زمني أدنى بين التكرارات لمنع العدّ
+//    المضاعف الناتج عن اهتزاز القراءة بين إطار وآخر.
+// ============================================================================
+
 List<CameraDescription> cameras = [];
 
 Future<void> main() async {
-  // التأكد من تهيئة كل حاجة قبل تشغيل التطبيق
   WidgetsFlutterBinding.ensureInitialized();
   try {
     cameras = await availableCameras();
   } catch (e) {
     debugPrint("خطأ في تحميل الكاميرات: $e");
   }
-  // تشغيل التطبيق
   runApp(const SweatAndScrollApp());
 }
 
-// تحديد مستويات الصعوبة
 enum UserLevel { beginner, intermediate, advanced }
 
-// =================================================================
-// 2. إعدادات التطبيق الأساسية (الألوان والخطوط)
-// =================================================================
 class SweatAndScrollApp extends StatelessWidget {
   const SweatAndScrollApp({super.key});
 
@@ -40,19 +43,16 @@ class SweatAndScrollApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       title: 'Sweat & Scroll',
       theme: ThemeData(
-        scaffoldBackgroundColor: const Color(0xFF121212), // خلفية داكنة فخمة
-        fontFamily: 'Cairo', // خط عربي مميز لو حبيت تضيفه
+        scaffoldBackgroundColor: const Color(0xFF121212),
+        fontFamily: 'Cairo',
         brightness: Brightness.dark,
-        primaryColor: const Color(0xFF6C63FF), // لون نيون أزرق/بنفسجي
+        primaryColor: const Color(0xFF6C63FF),
       ),
       home: const MainScreen(),
     );
   }
 }
 
-// =================================================================
-// 3. الشاشة الرئيسية للتطبيق
-// =================================================================
 class MainScreen extends StatefulWidget {
   const MainScreen({super.key});
 
@@ -61,43 +61,59 @@ class MainScreen extends StatefulWidget {
 }
 
 class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
-  // قناة الاتصال مع كود الأندرويد اللي عملناه لقفل الشاشة
   static const platform = MethodChannel('com.example.sweat_and_scroll_app/overlay');
 
-  // أدوات الكاميرا والذكاء الاصطناعي
-  CameraController? controller;
-  final PoseDetector _poseDetector = PoseDetector(options: PoseDetectorOptions());
+  // خريطة تُستخدم لحساب دوران الصورة على أندرويد بناءً على اتجاه الجهاز الفعلي
+  static const Map<DeviceOrientation, int> _orientations = {
+    DeviceOrientation.portraitUp: 0,
+    DeviceOrientation.landscapeLeft: 90,
+    DeviceOrientation.portraitDown: 180,
+    DeviceOrientation.landscapeRight: 270,
+  };
 
-  // الإحصائيات والأرقام
+  // الحد الأدنى لمستوى الثقة (likelihood) في أي نقطة قبل الوثوق بها لحساب الزاوية
+  static const double _minLikelihood = 0.6;
+
+  // أقل فاصل زمني بين تكرارين محتسبين لنفس التمرين، لمنع العدّ المضاعف بسبب الاهتزاز
+  static const Duration _repCooldown = Duration(milliseconds: 600);
+
+  // حجم نافذة التنعيم (متوسط آخر N قراءة للزاوية) لتقليل تذبذب القراءة بين الإطارات
+  static const int _smoothingWindow = 3;
+
+  CameraController? controller;
+  final PoseDetector _poseDetector = PoseDetector(
+    options: PoseDetectorOptions(
+      model: PoseDetectionModel.accurate, // دقة أعلى بدل الوضع الافتراضي base
+      mode: PoseDetectionMode.stream,
+    ),
+  );
+
   int points = 0;
   UserLevel level = UserLevel.beginner;
   int squatsCount = 0;
   int pushUpsCount = 0;
 
-  // حالات الكاميرا
   bool _isDetecting = false;
   bool _isCameraInitialized = false;
 
-  // حالات التمارين (فوق أو تحت)
   String _squatState = "up";
   String _pushUpState = "up";
+  DateTime? _lastSquatTime;
+  DateTime? _lastPushUpTime;
 
-  // نظام الوقت
-  int _allowedScrollTime = 30; // الوقت المبدئي 30 ثانية
-  final int _maxScrollTime = 300; // أقصى وقت 5 دقائق عشان المستخدم ميدمنش
+  final List<double> _squatAngleBuffer = [];
+  final List<double> _pushUpAngleBuffer = [];
+
+  int _allowedScrollTime = 30;
+  final int _maxScrollTime = 300;
   Timer? _scrollTimer;
   bool _isAppBlocked = false;
-
-  // تأثير بصري عند نجاح العدة
   bool _showSuccessFlash = false;
 
-  // =================================================================
-  // 4. دورة حياة التطبيق (بداية التشغيل والإغلاق)
-  // =================================================================
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this); // مراقبة حالة التطبيق
+    WidgetsBinding.instance.addObserver(this);
     _loadData();
     _checkAndRequestPermissions();
     _initializeCamera();
@@ -107,26 +123,21 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    controller?.dispose(); // قفل الكاميرا لتوفير البطارية
-    _poseDetector.close(); // قفل الـ AI
-    _scrollTimer?.cancel(); // إيقاف العداد
+    controller?.dispose();
+    _poseDetector.close();
+    _scrollTimer?.cancel();
     super.dispose();
   }
 
-  // الدالة دي بتراقب لو طلعت بره التطبيق ورجعت
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
-      // لو التطبيق رجع يشتغل وكان المفروض مقفول، اقفله تاني
       if (_isAppBlocked) {
         _forceCloseBackgroundApps();
       }
     }
   }
 
-  // =================================================================
-  // 5. أوامر الأندرويد (الصلاحيات والقفل)
-  // =================================================================
   Future<void> _checkAndRequestPermissions() async {
     try {
       await platform.invokeMethod('requestPermissions');
@@ -135,7 +146,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     }
   }
 
-  // عداد الوقت اللي بيقل كل ثانية
   void _startUsageLimitTimer() {
     _scrollTimer?.cancel();
     _scrollTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
@@ -150,22 +160,19 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     });
   }
 
-  // أمر طرد المستخدم من التطبيقات التانية
   Future<void> _forceCloseBackgroundApps() async {
     try {
       await platform.invokeMethod('blockScreen');
     } catch (_) {}
   }
 
-  // تزويد الوقت لما تعمل تمرين
   void _addBonusTime(int seconds) {
     setState(() {
       _allowedScrollTime = (_allowedScrollTime + seconds).clamp(0, _maxScrollTime);
       _isAppBlocked = false;
-      _showSuccessFlash = true; // تشغيل الوميض الأخضر
+      _showSuccessFlash = true;
     });
 
-    // إخفاء الوميض بعد نص ثانية
     Future.delayed(const Duration(milliseconds: 500), () {
       if (mounted) setState(() => _showSuccessFlash = false);
     });
@@ -175,7 +182,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     } catch (_) {}
   }
 
-  // رسالة تظهر للمستخدم لو حصل خطأ
   void _showErrorSnackBar(String message) {
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -184,9 +190,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     }
   }
 
-  // =================================================================
-  // 6. حفظ البيانات في ذاكرة الموبايل (عشان متضيعش لو التطبيق اتقفل)
-  // =================================================================
   Future<void> _loadData() async {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
@@ -205,21 +208,29 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     await prefs.setInt('level', level.index);
   }
 
-  // =================================================================
-  // 7. تشغيل الكاميرا والذكاء الاصطناعي
-  // =================================================================
   Future<void> _initializeCamera() async {
     if (cameras.isEmpty) {
       _showErrorSnackBar("لم يتم العثور على كاميرا في هذا الجهاز.");
       return;
     }
-    // اختيار الكاميرا الأمامية
     final camera = cameras.firstWhere(
       (cam) => cam.lensDirection == CameraLensDirection.front,
       orElse: () => cameras[0],
     );
 
-    controller = CameraController(camera, ResolutionPreset.medium, enableAudio: false);
+    controller = CameraController(
+      camera,
+      ResolutionPreset.medium,
+      enableAudio: false,
+      // *** هذا هو الإصلاح الأهم ***
+      // بدون تحديد imageFormatGroup، ترسل أندرويد صيغة YUV_420_888 الخام (بها
+      // padding وتداخل بين القنوات). الكود القديم كان يدمج هذه البيانات
+      // ويصنّفها للمكتبة على أنها NV21 رغم أنها ليست كذلك، فتصل صورة
+      // "مشوّشة" إلى MLKit ويفشل الكشف أو يعطي نتائج عشوائية. بتحديد nv21
+      // هنا صراحة، تقوم أندرويد نفسها بعملية التحويل الصحيحة قبل أن تصل
+      // البيانات إلى Dart (هذا موصى به رسمياً من حزمة google_mlkit_commons).
+      imageFormatGroup: Platform.isAndroid ? ImageFormatGroup.nv21 : ImageFormatGroup.bgra8888,
+    );
 
     try {
       await controller!.initialize();
@@ -235,7 +246,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     }
   }
 
-  // إرسال الصورة للذكاء الاصطناعي
   Future<void> _processImage(CameraImage image) async {
     final inputImage = _inputImageFromCameraImage(image);
     if (inputImage == null) {
@@ -245,79 +255,129 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     try {
       final poses = await _poseDetector.processImage(inputImage);
       if (poses.isNotEmpty) {
-        // لو لقى شخص في الصورة، ابدأ احسب التمارين
         _trackSquatImproved(poses.first);
         _trackPushUpImproved(poses.first);
       }
-    } catch (_) {}
-    finally {
+    } catch (e) {
+      // كانت الأخطاء تُبتلع بصمت سابقاً؛ طباعتها في وضع التطوير تسهّل تشخيص
+      // أي مشاكل مستقبلية بدل أن يبدو التطبيق "متعطلاً" بلا سبب واضح.
+      if (kDebugMode) debugPrint("خطأ أثناء تحليل الإطار: $e");
+    } finally {
       _isDetecting = false;
     }
   }
 
-  // =================================================================
-  // 8. عبقرية الـ AI (حساب الزوايا بدقة تامة)
-  // =================================================================
   double _calculateAngle(PoseLandmark first, PoseLandmark mid, PoseLandmark last) {
     double radians = math.atan2(last.y - mid.y, last.x - mid.x) -
-                     math.atan2(first.y - mid.y, first.x - mid.x);
+        math.atan2(first.y - mid.y, first.x - mid.x);
     double angle = (radians * 180 / math.pi).abs();
     return angle > 180.0 ? 360.0 - angle : angle;
   }
 
-  void _trackSquatImproved(Pose pose) {
-    final hip = pose.landmarks[PoseLandmarkType.leftHip];
-    final knee = pose.landmarks[PoseLandmarkType.leftKnee];
-    final ankle = pose.landmarks[PoseLandmarkType.leftAnkle];
+  /// يختار الجانب (يسار/يمين) الأكثر وضوحاً للكاميرا بناءً على مستوى الثقة
+  /// في كل نقطة، بدل الاعتماد دوماً على الجانب الأيسر فقط. يرجع null إن لم
+  /// يكن أي من الجانبين واضحاً بثقة كافية في هذا الإطار.
+  List<PoseLandmark>? _pickReliableSide(
+    Pose pose,
+    PoseLandmarkType leftA,
+    PoseLandmarkType leftB,
+    PoseLandmarkType leftC,
+    PoseLandmarkType rightA,
+    PoseLandmarkType rightB,
+    PoseLandmarkType rightC,
+  ) {
+    final left = [pose.landmarks[leftA], pose.landmarks[leftB], pose.landmarks[leftC]];
+    final right = [pose.landmarks[rightA], pose.landmarks[rightB], pose.landmarks[rightC]];
 
-    if (hip != null && knee != null && ankle != null) {
-      double angle = _calculateAngle(hip, knee, ankle);
-      // زاوية النزول
-      if (angle < 100.0) {
-        _squatState = "down";
-      }
-      // زاوية الطلوع والوقوف المفرود
-      else if (angle > 160.0 && _squatState == "down") {
-        _squatState = "up";
+    double scoreOf(List<PoseLandmark?> pts) {
+      if (pts.any((p) => p == null)) return -1;
+      return pts.map((p) => p!.likelihood).reduce(math.min);
+    }
+
+    final leftScore = scoreOf(left);
+    final rightScore = scoreOf(right);
+
+    if (leftScore < _minLikelihood && rightScore < _minLikelihood) return null;
+
+    final chosen = leftScore >= rightScore ? left : right;
+    return [chosen[0]!, chosen[1]!, chosen[2]!];
+  }
+
+  double _smooth(List<double> buffer, double newValue) {
+    buffer.add(newValue);
+    if (buffer.length > _smoothingWindow) buffer.removeAt(0);
+    return buffer.reduce((a, b) => a + b) / buffer.length;
+  }
+
+  void _trackSquatImproved(Pose pose) {
+    final side = _pickReliableSide(
+      pose,
+      PoseLandmarkType.leftHip,
+      PoseLandmarkType.leftKnee,
+      PoseLandmarkType.leftAnkle,
+      PoseLandmarkType.rightHip,
+      PoseLandmarkType.rightKnee,
+      PoseLandmarkType.rightAnkle,
+    );
+    if (side == null) return;
+
+    final angle = _smooth(_squatAngleBuffer, _calculateAngle(side[0], side[1], side[2]));
+
+    if (angle < 100.0) {
+      _squatState = "down";
+    } else if (angle > 160.0 && _squatState == "down") {
+      final now = DateTime.now();
+      final canCount = _lastSquatTime == null || now.difference(_lastSquatTime!) > _repCooldown;
+      _squatState = "up"; // إغلاق دورة الحالة دوماً لمنع بقاء "down" عالقة
+      if (canCount) {
+        _lastSquatTime = now;
         _onExerciseDetected(isSquat: true);
-        _addBonusTime(20); // مكافأة السكوات 20 ثانية
+        _addBonusTime(20);
       }
     }
   }
 
   void _trackPushUpImproved(Pose pose) {
-    final shoulder = pose.landmarks[PoseLandmarkType.leftShoulder];
-    final elbow = pose.landmarks[PoseLandmarkType.leftElbow];
-    final wrist = pose.landmarks[PoseLandmarkType.leftWrist];
+    final side = _pickReliableSide(
+      pose,
+      PoseLandmarkType.leftShoulder,
+      PoseLandmarkType.leftElbow,
+      PoseLandmarkType.leftWrist,
+      PoseLandmarkType.rightShoulder,
+      PoseLandmarkType.rightElbow,
+      PoseLandmarkType.rightWrist,
+    );
+    if (side == null) return;
 
-    if (shoulder != null && elbow != null && wrist != null) {
-      double angle = _calculateAngle(shoulder, elbow, wrist);
-      if (angle < 90.0) {
-        _pushUpState = "down";
-      } else if (angle > 160.0 && _pushUpState == "down") {
-        _pushUpState = "up";
+    final angle = _smooth(_pushUpAngleBuffer, _calculateAngle(side[0], side[1], side[2]));
+
+    if (angle < 90.0) {
+      _pushUpState = "down";
+    } else if (angle > 160.0 && _pushUpState == "down") {
+      final now = DateTime.now();
+      final canCount = _lastPushUpTime == null || now.difference(_lastPushUpTime!) > _repCooldown;
+      _pushUpState = "up";
+      if (canCount) {
+        _lastPushUpTime = now;
         _onExerciseDetected(isSquat: false);
-        _addBonusTime(30); // مكافأة الضغط 30 ثانية
+        _addBonusTime(30);
       }
     }
   }
 
   void _onExerciseDetected({required bool isSquat}) {
+    if (!mounted) return;
     setState(() {
       if (isSquat) {
         squatsCount++;
       } else {
         pushUpsCount++;
       }
-      // حساب النقاط حسب المستوى
       points += (level == UserLevel.beginner) ? 10 : (level == UserLevel.intermediate) ? 20 : 30;
     });
     _saveData();
   }
 
-  // =================================================================
-  // 9. تصميم الواجهة (UI) الخرافي
-  // =================================================================
   @override
   Widget build(BuildContext context) {
     double progress = _allowedScrollTime / _maxScrollTime;
@@ -333,7 +393,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       ),
       body: Column(
         children: [
-          // شريط الوقت المتبقي
           Container(
             padding: const EdgeInsets.all(20),
             decoration: const BoxDecoration(
@@ -378,7 +437,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 
           const SizedBox(height: 20),
 
-          // شاشة الكاميرا مع تأثير النجاح
           Expanded(
             flex: 5,
             child: Padding(
@@ -402,7 +460,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                         : CameraPreview(controller!),
                   ),
 
-                  // الوميض الأخضر اللي بيظهر لما تعمل تمرينة صح
                   if (_showSuccessFlash)
                     Container(
                       decoration: BoxDecoration(
@@ -419,7 +476,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 
           const SizedBox(height: 20),
 
-          // لوحة الإحصائيات والأزرار
           Expanded(
             flex: 4,
             child: Container(
@@ -444,7 +500,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                     ],
                   ),
 
-                  // اختيار مستوى الصعوبة
                   Container(
                     padding: const EdgeInsets.all(5),
                     decoration: BoxDecoration(
@@ -472,7 +527,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     );
   }
 
-  // تصميم كروت الإحصائيات بشكل بارز ومجسم
   Widget _buildStatCard(String title, int value, Color color, IconData icon, {bool isLarge = false}) {
     return Container(
       width: isLarge ? 120 : 100,
@@ -496,7 +550,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     );
   }
 
-  // تصميم أزرار المستويات
   Widget _buildLevelChip(String label, UserLevel chipLevel) {
     bool isSelected = level == chipLevel;
     return ChoiceChip(
@@ -516,40 +569,46 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     );
   }
 
-  // =================================================================
-  // 10. محول الصور للذكاء الاصطناعي (أكواد معقدة متلعبش فيها)
-  // =================================================================
   InputImage? _inputImageFromCameraImage(CameraImage image) {
+    if (controller == null) return null;
     final camera = controller!.description;
-    final rotation = camera.lensDirection == CameraLensDirection.front
-        ? InputImageRotation.rotation270deg
-        : InputImageRotationValue.fromRawValue(camera.sensorOrientation) ?? InputImageRotation.rotation0deg;
 
-    final format = InputImageFormatValue.fromRawValue(image.format.raw);
-
-    if (format == InputImageFormat.yuv420 || format == InputImageFormat.yuv_420_888) {
-      final allBytes = WriteBuffer();
-      for (final plane in image.planes) { allBytes.putUint8List(plane.bytes); }
-      return InputImage.fromBytes(
-        bytes: allBytes.done().buffer.asUint8List(),
-        metadata: InputImageMetadata(
-          size: Size(image.width.toDouble(), image.height.toDouble()),
-          rotation: rotation,
-          format: InputImageFormat.nv21,
-          bytesPerRow: image.planes[0].bytesPerRow,
-        ),
-      );
-    } else if (format == InputImageFormat.bgra8888) {
-      return InputImage.fromBytes(
-        bytes: image.planes[0].bytes,
-        metadata: InputImageMetadata(
-          size: Size(image.width.toDouble(), image.height.toDouble()),
-          rotation: rotation,
-          format: InputImageFormat.bgra8888,
-          bytesPerRow: image.planes[0].bytesPerRow,
-        ),
-      );
+    // حساب زاوية الدوران الصحيحة بدل تثبيتها على 270 درجة دائماً. القيمة
+    // الثابتة كانت "تعمل بالصدفة" فقط على الأجهزة التي يكون sensorOrientation
+    // فيها = 270 والجهاز في وضع portrait — وتفشل على أجهزة أخرى.
+    InputImageRotation? rotation;
+    if (Platform.isIOS) {
+      rotation = InputImageRotationValue.fromRawValue(camera.sensorOrientation);
+    } else if (Platform.isAndroid) {
+      var rotationCompensation = _orientations[controller!.value.deviceOrientation];
+      if (rotationCompensation == null) return null;
+      if (camera.lensDirection == CameraLensDirection.front) {
+        rotationCompensation = (camera.sensorOrientation + rotationCompensation) % 360;
+      } else {
+        rotationCompensation = (camera.sensorOrientation - rotationCompensation + 360) % 360;
+      }
+      rotation = InputImageRotationValue.fromRawValue(rotationCompensation);
     }
-    return null;
+    if (rotation == null) return null;
+
+    // بما أننا حدّدنا imageFormatGroup صراحة عند تهيئة الكاميرا (nv21/bgra8888)،
+    // صيغة البيانات معروفة سلفاً ولا حاجة لتخمينها من image.format.raw.
+    final format = Platform.isAndroid ? InputImageFormat.nv21 : InputImageFormat.bgra8888;
+
+    final WriteBuffer allBytes = WriteBuffer();
+    for (final plane in image.planes) {
+      allBytes.putUint8List(plane.bytes);
+    }
+    final bytes = allBytes.done().buffer.asUint8List();
+
+    return InputImage.fromBytes(
+      bytes: bytes,
+      metadata: InputImageMetadata(
+        size: Size(image.width.toDouble(), image.height.toDouble()),
+        rotation: rotation,
+        format: format,
+        bytesPerRow: image.planes[0].bytesPerRow,
+      ),
+    );
   }
 }
