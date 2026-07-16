@@ -8,18 +8,6 @@ import 'package:camera/camera.dart';
 import 'package:google_mlkit_pose_detection/google_mlkit_pose_detection.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-// ============================================================================
-// ملخص الإصلاحات في هذا الملف (بالتفصيل في رسالة الشات):
-// 1) تحديد imageFormatGroup صراحة عند تهيئة الكاميرا (nv21 / bgra8888) — هذا
-//    هو سبب عطل الكشف الرئيسي؛ بدونه كانت البيانات الخام (YUV_420_888) تُصنَّف
-//    خطأً على أنها NV21 فتصل صورة مشوّهة إلى MLKit.
-// 2) حساب زاوية دوران الصورة (rotation) ديناميكياً بدل تثبيتها على 270 درجة.
-// 3) رفع دقة النموذج إلى PoseDetectionModel.accurate.
-// 4) اختيار الجانب (يمين/يسار) الأوضح للكاميرا تلقائياً، وتجاهل أي نقطة بثقة
-//    منخفضة، وتنعيم القراءات، ووضع فاصل زمني أدنى بين التكرارات لمنع العدّ
-//    المضاعف الناتج عن اهتزاز القراءة بين إطار وآخر.
-// ============================================================================
-
 List<CameraDescription> cameras = [];
 
 Future<void> main() async {
@@ -63,7 +51,6 @@ class MainScreen extends StatefulWidget {
 class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   static const platform = MethodChannel('com.example.sweat_and_scroll_app/overlay');
 
-  // خريطة تُستخدم لحساب دوران الصورة على أندرويد بناءً على اتجاه الجهاز الفعلي
   static const Map<DeviceOrientation, int> _orientations = {
     DeviceOrientation.portraitUp: 0,
     DeviceOrientation.landscapeLeft: 90,
@@ -71,19 +58,14 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     DeviceOrientation.landscapeRight: 270,
   };
 
-  // الحد الأدنى لمستوى الثقة (likelihood) في أي نقطة قبل الوثوق بها لحساب الزاوية
   static const double _minLikelihood = 0.6;
-
-  // أقل فاصل زمني بين تكرارين محتسبين لنفس التمرين، لمنع العدّ المضاعف بسبب الاهتزاز
   static const Duration _repCooldown = Duration(milliseconds: 600);
-
-  // حجم نافذة التنعيم (متوسط آخر N قراءة للزاوية) لتقليل تذبذب القراءة بين الإطارات
   static const int _smoothingWindow = 3;
 
   CameraController? controller;
   final PoseDetector _poseDetector = PoseDetector(
     options: PoseDetectorOptions(
-      model: PoseDetectionModel.accurate, // دقة أعلى بدل الوضع الافتراضي base
+      model: PoseDetectionModel.accurate,
       mode: PoseDetectionMode.stream,
     ),
   );
@@ -95,6 +77,9 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 
   bool _isDetecting = false;
   bool _isCameraInitialized = false;
+
+  DateTime? _lastFrameProcessedTime;
+  static const Duration _frameThrottleDuration = Duration(milliseconds: 150);
 
   String _squatState = "up";
   String _pushUpState = "up";
@@ -110,6 +95,9 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   bool _isAppBlocked = false;
   bool _showSuccessFlash = false;
 
+  Pose? _currentPose;
+  Size? _absoluteImageSize;
+
   @override
   void initState() {
     super.initState();
@@ -123,6 +111,9 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    if (controller != null && controller!.value.isStreamingImages) {
+      controller!.stopImageStream();
+    }
     controller?.dispose();
     _poseDetector.close();
     _scrollTimer?.cancel();
@@ -131,9 +122,18 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) {
+    if (controller == null || !controller!.value.isInitialized) return;
+
+    if (state == AppLifecycleState.inactive) {
+      if (controller!.value.isStreamingImages) {
+        controller!.stopImageStream();
+      }
+    } else if (state == AppLifecycleState.resumed) {
       if (_isAppBlocked) {
         _forceCloseBackgroundApps();
+      }
+      if (!controller!.value.isStreamingImages) {
+        controller!.startImageStream(_handleCameraImage);
       }
     }
   }
@@ -222,28 +222,30 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       camera,
       ResolutionPreset.medium,
       enableAudio: false,
-      // *** هذا هو الإصلاح الأهم ***
-      // بدون تحديد imageFormatGroup، ترسل أندرويد صيغة YUV_420_888 الخام (بها
-      // padding وتداخل بين القنوات). الكود القديم كان يدمج هذه البيانات
-      // ويصنّفها للمكتبة على أنها NV21 رغم أنها ليست كذلك، فتصل صورة
-      // "مشوّشة" إلى MLKit ويفشل الكشف أو يعطي نتائج عشوائية. بتحديد nv21
-      // هنا صراحة، تقوم أندرويد نفسها بعملية التحويل الصحيحة قبل أن تصل
-      // البيانات إلى Dart (هذا موصى به رسمياً من حزمة google_mlkit_commons).
       imageFormatGroup: Platform.isAndroid ? ImageFormatGroup.nv21 : ImageFormatGroup.bgra8888,
     );
 
     try {
       await controller!.initialize();
-      await controller!.startImageStream((image) {
-        if (!_isDetecting) {
-          _isDetecting = true;
-          _processImage(image);
-        }
-      });
+      await controller!.startImageStream(_handleCameraImage);
       if (mounted) setState(() => _isCameraInitialized = true);
     } catch (e) {
       _showErrorSnackBar("حدث خطأ في تشغيل الكاميرا.");
     }
+  }
+
+  void _handleCameraImage(CameraImage image) {
+    if (_isDetecting) return;
+
+    final now = DateTime.now();
+    if (_lastFrameProcessedTime != null &&
+        now.difference(_lastFrameProcessedTime!) < _frameThrottleDuration) {
+      return;
+    }
+
+    _lastFrameProcessedTime = now;
+    _isDetecting = true;
+    _processImage(image);
   }
 
   Future<void> _processImage(CameraImage image) async {
@@ -257,10 +259,20 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       if (poses.isNotEmpty) {
         _trackSquatImproved(poses.first);
         _trackPushUpImproved(poses.first);
+
+        if (mounted) {
+          setState(() {
+            _currentPose = poses.first;
+            final isPortrait = MediaQuery.of(context).orientation == Orientation.portrait;
+            _absoluteImageSize = isPortrait
+                ? Size(image.height.toDouble(), image.width.toDouble())
+                : Size(image.width.toDouble(), image.height.toDouble());
+          });
+        }
+      } else {
+        if (mounted) setState(() => _currentPose = null);
       }
     } catch (e) {
-      // كانت الأخطاء تُبتلع بصمت سابقاً؛ طباعتها في وضع التطوير تسهّل تشخيص
-      // أي مشاكل مستقبلية بدل أن يبدو التطبيق "متعطلاً" بلا سبب واضح.
       if (kDebugMode) debugPrint("خطأ أثناء تحليل الإطار: $e");
     } finally {
       _isDetecting = false;
@@ -274,9 +286,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     return angle > 180.0 ? 360.0 - angle : angle;
   }
 
-  /// يختار الجانب (يسار/يمين) الأكثر وضوحاً للكاميرا بناءً على مستوى الثقة
-  /// في كل نقطة، بدل الاعتماد دوماً على الجانب الأيسر فقط. يرجع null إن لم
-  /// يكن أي من الجانبين واضحاً بثقة كافية في هذا الإطار.
   List<PoseLandmark>? _pickReliableSide(
     Pose pose,
     PoseLandmarkType leftA,
@@ -328,7 +337,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     } else if (angle > 160.0 && _squatState == "down") {
       final now = DateTime.now();
       final canCount = _lastSquatTime == null || now.difference(_lastSquatTime!) > _repCooldown;
-      _squatState = "up"; // إغلاق دورة الحالة دوماً لمنع بقاء "down" عالقة
+      _squatState = "up";
       if (canCount) {
         _lastSquatTime = now;
         _onExerciseDetected(isSquat: true);
@@ -457,7 +466,16 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                     ),
                     child: !_isCameraInitialized
                         ? const Center(child: CircularProgressIndicator(color: Color(0xFF6C63FF)))
-                        : CameraPreview(controller!),
+                        : Stack(
+                            fit: StackFit.expand,
+                            children: [
+                              CameraPreview(controller!),
+                              if (_currentPose != null && _absoluteImageSize != null)
+                                CustomPaint(
+                                  painter: PosePainter(_currentPose!, _absoluteImageSize!),
+                                ),
+                            ],
+                          ),
                   ),
 
                   if (_showSuccessFlash)
@@ -573,9 +591,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     if (controller == null) return null;
     final camera = controller!.description;
 
-    // حساب زاوية الدوران الصحيحة بدل تثبيتها على 270 درجة دائماً. القيمة
-    // الثابتة كانت "تعمل بالصدفة" فقط على الأجهزة التي يكون sensorOrientation
-    // فيها = 270 والجهاز في وضع portrait — وتفشل على أجهزة أخرى.
     InputImageRotation? rotation;
     if (Platform.isIOS) {
       rotation = InputImageRotationValue.fromRawValue(camera.sensorOrientation);
@@ -591,8 +606,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     }
     if (rotation == null) return null;
 
-    // بما أننا حدّدنا imageFormatGroup صراحة عند تهيئة الكاميرا (nv21/bgra8888)،
-    // صيغة البيانات معروفة سلفاً ولا حاجة لتخمينها من image.format.raw.
     final format = Platform.isAndroid ? InputImageFormat.nv21 : InputImageFormat.bgra8888;
 
     final WriteBuffer allBytes = WriteBuffer();
@@ -610,5 +623,69 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         bytesPerRow: image.planes[0].bytesPerRow,
       ),
     );
+  }
+}
+
+class PosePainter extends CustomPainter {
+  final Pose pose;
+  final Size absoluteImageSize;
+
+  PosePainter(this.pose, this.absoluteImageSize);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final pointPaint = Paint()
+      ..style = PaintingStyle.fill
+      ..strokeWidth = 4.0
+      ..color = const Color(0xFF00E676);
+
+    final linePaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 4.0
+      ..color = const Color(0xFF6C63FF).withOpacity(0.8);
+
+    double translateX(double x) {
+      return size.width - (x * size.width / absoluteImageSize.width);
+    }
+
+    double translateY(double y) {
+      return y * size.height / absoluteImageSize.height;
+    }
+
+    for (final landmark in pose.landmarks.values) {
+      if (landmark.likelihood > 0.6) {
+        canvas.drawCircle(Offset(translateX(landmark.x), translateY(landmark.y)), 6, pointPaint);
+      }
+    }
+
+    void drawConnection(PoseLandmarkType type1, PoseLandmarkType type2) {
+      final l1 = pose.landmarks[type1];
+      final l2 = pose.landmarks[type2];
+      if (l1 != null && l2 != null && l1.likelihood > 0.6 && l2.likelihood > 0.6) {
+        canvas.drawLine(
+          Offset(translateX(l1.x), translateY(l1.y)),
+          Offset(translateX(l2.x), translateY(l2.y)),
+          linePaint,
+        );
+      }
+    }
+
+    drawConnection(PoseLandmarkType.leftShoulder, PoseLandmarkType.leftElbow);
+    drawConnection(PoseLandmarkType.leftElbow, PoseLandmarkType.leftWrist);
+    drawConnection(PoseLandmarkType.rightShoulder, PoseLandmarkType.rightElbow);
+    drawConnection(PoseLandmarkType.rightElbow, PoseLandmarkType.rightWrist);
+    drawConnection(PoseLandmarkType.leftShoulder, PoseLandmarkType.rightShoulder);
+    drawConnection(PoseLandmarkType.leftShoulder, PoseLandmarkType.leftHip);
+    drawConnection(PoseLandmarkType.rightShoulder, PoseLandmarkType.rightHip);
+    drawConnection(PoseLandmarkType.leftHip, PoseLandmarkType.rightHip);
+    drawConnection(PoseLandmarkType.leftHip, PoseLandmarkType.leftKnee);
+    drawConnection(PoseLandmarkType.leftKnee, PoseLandmarkType.leftAnkle);
+    drawConnection(PoseLandmarkType.rightHip, PoseLandmarkType.rightKnee);
+    drawConnection(PoseLandmarkType.rightKnee, PoseLandmarkType.rightAnkle);
+  }
+
+  @override
+  bool shouldRepaint(covariant PosePainter oldDelegate) {
+    return oldDelegate.pose != pose || oldDelegate.absoluteImageSize != absoluteImageSize;
   }
 }
