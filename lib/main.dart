@@ -22,6 +22,18 @@ Future<void> main() async {
 
 enum UserLevel { beginner, intermediate, advanced }
 
+class AppColors {
+  static const bg = Color(0xFF0F0F1A);
+  static const surface = Color(0xFF1A1A2E);
+  static const surfaceLight = Color(0xFF232340);
+  static const primary = Color(0xFF6C63FF);
+  static const primaryDark = Color(0xFF4B45B3);
+  static const neon = Color(0xFF00F0FF);
+  static const success = Color(0xFF00E676);
+  static const danger = Color(0xFFFF1744);
+  static const amber = Color(0xFFFFC107);
+}
+
 class SweatAndScrollApp extends StatelessWidget {
   const SweatAndScrollApp({super.key});
 
@@ -31,10 +43,14 @@ class SweatAndScrollApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       title: 'Sweat & Scroll',
       theme: ThemeData(
-        scaffoldBackgroundColor: const Color(0xFF121212),
+        scaffoldBackgroundColor: AppColors.bg,
         fontFamily: 'Cairo',
         brightness: Brightness.dark,
-        primaryColor: const Color(0xFF6C63FF),
+        primaryColor: AppColors.primary,
+        colorScheme: const ColorScheme.dark(
+          primary: AppColors.primary,
+          secondary: AppColors.neon,
+        ),
       ),
       home: const MainScreen(),
     );
@@ -48,8 +64,10 @@ class MainScreen extends StatefulWidget {
   State<MainScreen> createState() => _MainScreenState();
 }
 
-class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
-  static const platform = MethodChannel('com.example.sweat_and_scroll_app/overlay');
+class _MainScreenState extends State<MainScreen>
+    with WidgetsBindingObserver, TickerProviderStateMixin {
+  static const platform =
+      MethodChannel('com.example.sweat_and_scroll_app/overlay');
 
   static const Map<DeviceOrientation, int> _orientations = {
     DeviceOrientation.portraitUp: 0,
@@ -63,12 +81,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   static const int _smoothingWindow = 3;
 
   CameraController? controller;
-  final PoseDetector _poseDetector = PoseDetector(
-    options: PoseDetectorOptions(
-      model: PoseDetectionModel.accurate,
-      mode: PoseDetectionMode.stream,
-    ),
-  );
+  PoseDetector? _poseDetector;
 
   int points = 0;
   UserLevel level = UserLevel.beginner;
@@ -77,6 +90,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 
   bool _isDetecting = false;
   bool _isCameraInitialized = false;
+  bool _isStreaming = false;
+  String? _cameraError;
 
   String _squatState = "up";
   String _pushUpState = "up";
@@ -92,14 +107,39 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   bool _isAppBlocked = false;
   bool _showSuccessFlash = false;
 
-  // لإرسال الإحداثيات للرسام النيون
+  // لرسم الهيكل النيوني فوق الكاميرا
   Pose? _latestPose;
-  Size? _imageSize;
+  Size? _imageSize; // الأبعاد بعد مراعاة الـ rotation (وليس raw image)
+  bool _isFrontCamera = true;
+
+  late final AnimationController _pulseController;
+  late final AnimationController _repController;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+
+    _pulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 900),
+    )..repeat(reverse: true);
+
+    _repController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 350),
+      lowerBound: 0.9,
+      upperBound: 1.15,
+      value: 1.0,
+    );
+
+    _poseDetector = PoseDetector(
+      options: PoseDetectorOptions(
+        model: PoseDetectionModel.accurate,
+        mode: PoseDetectionMode.stream,
+      ),
+    );
+
     _loadData();
     _checkAndRequestPermissions();
     _initializeCamera();
@@ -109,17 +149,31 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _pulseController.dispose();
+    _repController.dispose();
+    _stopStreamSafely();
     controller?.dispose();
-    _poseDetector.close();
+    _poseDetector?.close();
     _scrollTimer?.cancel();
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) {
+    final cam = controller;
+    if (cam == null || !cam.value.isInitialized) return;
+
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused) {
+      // إيقاف الـ stream عند الخروج من التطبيق: يوفر بطارية ويمنع كراشات
+      // الكاميرا الشائعة عند عودة التطبيق من الخلفية.
+      _stopStreamSafely();
+    } else if (state == AppLifecycleState.resumed) {
       if (_isAppBlocked) {
         _forceCloseBackgroundApps();
+      }
+      if (_isCameraInitialized && !_isStreaming) {
+        _startStreamSafely();
       }
     }
   }
@@ -129,12 +183,19 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       await platform.invokeMethod('requestPermissions');
     } on PlatformException catch (e) {
       _showErrorSnackBar("مشكلة في الصلاحيات: ${e.message}");
+    } on MissingPluginException {
+      // القناة الأصلية (native) لسه مش مضافة على المنصة الحالية أثناء التطوير
+      debugPrint("overlay channel غير متاح على هذه المنصة بعد.");
     }
   }
 
   void _startUsageLimitTimer() {
     _scrollTimer?.cancel();
     _scrollTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) {
+        timer.cancel();
+        return;
+      }
       if (_allowedScrollTime > 0) {
         setState(() => _allowedScrollTime--);
       } else {
@@ -149,14 +210,25 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   Future<void> _forceCloseBackgroundApps() async {
     try {
       await platform.invokeMethod('blockScreen');
-    } catch (_) {}
+    } on PlatformException catch (e) {
+      debugPrint("blockScreen فشلت: ${e.message}");
+    } on MissingPluginException {
+      debugPrint("blockScreen غير متاحة على هذه المنصة.");
+    }
   }
 
   void _addBonusTime(int seconds) {
+    if (!mounted) return;
     setState(() {
-      _allowedScrollTime = (_allowedScrollTime + seconds).clamp(0, _maxScrollTime);
+      _allowedScrollTime =
+          (_allowedScrollTime + seconds).clamp(0, _maxScrollTime);
       _isAppBlocked = false;
       _showSuccessFlash = true;
+    });
+
+    HapticFeedback.mediumImpact();
+    _repController.forward().then((_) {
+      if (mounted) _repController.reverse();
     });
 
     Future.delayed(const Duration(milliseconds: 500), () {
@@ -165,81 +237,143 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 
     try {
       platform.invokeMethod('unblockScreen');
+    } on MissingPluginException {
+      // متاح فقط على المنصة الفعلية
     } catch (_) {}
   }
 
   void _showErrorSnackBar(String message) {
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(message), backgroundColor: Colors.redAccent),
-      );
-    }
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: AppColors.danger,
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      ),
+    );
   }
 
   Future<void> _loadData() async {
-    final prefs = await SharedPreferences.getInstance();
-    setState(() {
-      points = prefs.getInt('points') ?? 0;
-      squatsCount = prefs.getInt('squatsCount') ?? 0;
-      pushUpsCount = prefs.getInt('pushUpsCount') ?? 0;
-      level = UserLevel.values[prefs.getInt('level') ?? 0];
-    });
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (!mounted) return;
+      setState(() {
+        points = prefs.getInt('points') ?? 0;
+        squatsCount = prefs.getInt('squatsCount') ?? 0;
+        pushUpsCount = prefs.getInt('pushUpsCount') ?? 0;
+        final savedLevel = prefs.getInt('level') ?? 0;
+        level = UserLevel.values[savedLevel.clamp(0, UserLevel.values.length - 1)];
+      });
+    } catch (e) {
+      debugPrint("فشل تحميل البيانات المحفوظة: $e");
+    }
   }
 
   Future<void> _saveData() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setInt('points', points);
-    await prefs.setInt('squatsCount', squatsCount);
-    await prefs.setInt('pushUpsCount', pushUpsCount);
-    await prefs.setInt('level', level.index);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt('points', points);
+      await prefs.setInt('squatsCount', squatsCount);
+      await prefs.setInt('pushUpsCount', pushUpsCount);
+      await prefs.setInt('level', level.index);
+    } catch (e) {
+      debugPrint("فشل حفظ البيانات: $e");
+    }
   }
 
   Future<void> _initializeCamera() async {
     if (cameras.isEmpty) {
-      _showErrorSnackBar("لم يتم العثور على كاميرا في هذا الجهاز.");
+      setState(() => _cameraError = "لم يتم العثور على كاميرا في هذا الجهاز.");
       return;
     }
     final camera = cameras.firstWhere(
       (cam) => cam.lensDirection == CameraLensDirection.front,
       orElse: () => cameras[0],
     );
+    _isFrontCamera = camera.lensDirection == CameraLensDirection.front;
 
     controller = CameraController(
       camera,
       ResolutionPreset.medium,
       enableAudio: false,
-      imageFormatGroup: Platform.isAndroid ? ImageFormatGroup.nv21 : ImageFormatGroup.bgra8888,
+      imageFormatGroup:
+          Platform.isAndroid ? ImageFormatGroup.nv21 : ImageFormatGroup.bgra8888,
     );
 
     try {
       await controller!.initialize();
-      await controller!.startImageStream((image) {
+      if (!mounted) return;
+      await _startStreamSafely();
+      setState(() {
+        _isCameraInitialized = true;
+        _cameraError = null;
+      });
+    } on CameraException catch (e) {
+      setState(() => _cameraError = "تعذر تشغيل الكاميرا: ${e.description ?? e.code}");
+    } catch (e) {
+      setState(() => _cameraError = "حدث خطأ غير متوقع في تشغيل الكاميرا.");
+    }
+  }
+
+  Future<void> _startStreamSafely() async {
+    final cam = controller;
+    if (cam == null || !cam.value.isInitialized || _isStreaming) return;
+    try {
+      await cam.startImageStream((image) {
         if (!_isDetecting) {
           _isDetecting = true;
           _processImage(image);
         }
       });
-      if (mounted) setState(() => _isCameraInitialized = true);
+      _isStreaming = true;
     } catch (e) {
-      _showErrorSnackBar("حدث خطأ في تشغيل الكاميرا.");
+      debugPrint("فشل بدء بث الصور: $e");
+    }
+  }
+
+  Future<void> _stopStreamSafely() async {
+    final cam = controller;
+    if (cam == null || !_isStreaming) return;
+    try {
+      if (cam.value.isStreamingImages) {
+        await cam.stopImageStream();
+      }
+    } catch (e) {
+      debugPrint("فشل إيقاف بث الصور: $e");
+    } finally {
+      _isStreaming = false;
     }
   }
 
   Future<void> _processImage(CameraImage image) async {
-    final inputImage = _inputImageFromCameraImage(image);
-    if (inputImage == null) {
+    final detector = _poseDetector;
+    if (detector == null) {
       _isDetecting = false;
       return;
     }
+
+    final result = _inputImageFromCameraImage(image);
+    if (result == null) {
+      _isDetecting = false;
+      return;
+    }
+
     try {
-      final poses = await _poseDetector.processImage(inputImage);
+      final poses = await detector.processImage(result.inputImage);
+      if (!mounted) return;
       if (poses.isNotEmpty) {
         _trackSquatImproved(poses.first);
         _trackPushUpImproved(poses.first);
         setState(() {
           _latestPose = poses.first;
-          _imageSize = Size(image.width.toDouble(), image.height.toDouble());
+          _imageSize = result.adjustedSize;
         });
+      } else {
+        // لا يوجد شخص واضح بالكاميرا: نمسح الرسم القديم بدل تجميده على آخر وضعية
+        if (_latestPose != null) {
+          setState(() => _latestPose = null);
+        }
       }
     } catch (e) {
       if (kDebugMode) debugPrint("خطأ أثناء تحليل الإطار: $e");
@@ -351,7 +485,11 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       } else {
         pushUpsCount++;
       }
-      points += (level == UserLevel.beginner) ? 10 : (level == UserLevel.intermediate) ? 20 : 30;
+      points += (level == UserLevel.beginner)
+          ? 10
+          : (level == UserLevel.intermediate)
+              ? 20
+              : 30;
     });
     _saveData();
   }
@@ -359,179 +497,322 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     double progress = _allowedScrollTime / _maxScrollTime;
+    final isLow = _allowedScrollTime <= 10 && !_isAppBlocked;
 
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('SWEAT & SCROLL',
-          style: TextStyle(fontWeight: FontWeight.w900, letterSpacing: 2, color: Colors.white)),
-        backgroundColor: const Color(0xFF1E1E2C),
-        elevation: 10,
-        shadowColor: Colors.black54,
-        centerTitle: true,
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [AppColors.bg, Color(0xFF15152A)],
+          ),
+        ),
+        child: SafeArea(
+          child: Column(
+            children: [
+              _buildHeader(),
+              _buildTimeCard(progress, isLow),
+              const SizedBox(height: 16),
+              Expanded(flex: 5, child: _buildCameraArea()),
+              const SizedBox(height: 16),
+              Expanded(flex: 4, child: _buildStatsPanel()),
+            ],
+          ),
+        ),
       ),
-      body: Column(
+    );
+  }
+
+  Widget _buildHeader() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 12, 20, 4),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          Container(
-            padding: const EdgeInsets.all(20),
-            decoration: const BoxDecoration(
-              color: Color(0xFF1E1E2C),
-              borderRadius: BorderRadius.only(
-                bottomLeft: Radius.circular(30),
-                bottomRight: Radius.circular(30),
+          ShaderMask(
+            shaderCallback: (bounds) => const LinearGradient(
+              colors: [AppColors.neon, AppColors.primary],
+            ).createShader(bounds),
+            child: const Text(
+              'SWEAT & SCROLL',
+              style: TextStyle(
+                fontWeight: FontWeight.w900,
+                fontSize: 22,
+                letterSpacing: 1.5,
+                color: Colors.white,
               ),
-              boxShadow: [BoxShadow(color: Colors.black26, blurRadius: 10, offset: Offset(0, 5))],
             ),
-            child: Column(
+          ),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            decoration: BoxDecoration(
+              color: AppColors.surfaceLight,
+              borderRadius: BorderRadius.circular(20),
+            ),
+            child: Row(
               children: [
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Icon(Icons.timer_outlined, color: Colors.amber, size: 30),
-                    Text(
-                      'الرصيد: $_allowedScrollTime ثانية',
-                      style: TextStyle(
-                        fontSize: 24,
-                        fontWeight: FontWeight.bold,
-                        color: _isAppBlocked ? Colors.redAccent : Colors.white,
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 15),
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(15),
-                  child: LinearProgressIndicator(
-                    value: progress,
-                    minHeight: 14,
-                    backgroundColor: Colors.white12,
-                    valueColor: AlwaysStoppedAnimation<Color>(
-                      _isAppBlocked ? Colors.redAccent : const Color(0xFF00E676)
-                    ),
-                  ),
-                ),
+                const Icon(Icons.stars_rounded, color: AppColors.amber, size: 18),
+                const SizedBox(width: 4),
+                Text('$points',
+                    style: const TextStyle(
+                        color: Colors.white, fontWeight: FontWeight.bold)),
               ],
             ),
           ),
-
-          const SizedBox(height: 20),
-
-          Expanded(
-            flex: 5,
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 20),
-              child: Stack(
-                alignment: Alignment.center,
-                children: [
-                  Container(
-                    width: double.infinity,
-                    clipBehavior: Clip.antiAlias,
-                    decoration: BoxDecoration(
-                      color: Colors.black,
-                      borderRadius: BorderRadius.circular(30),
-                      border: Border.all(color: const Color(0xFF6C63FF), width: 3),
-                      boxShadow: const [
-                        BoxShadow(color: Color(0x4D6C63FF), blurRadius: 20, spreadRadius: 3)
-                      ]
-                    ),
-                    child: !_isCameraInitialized
-                        ? const Center(child: CircularProgressIndicator(color: Color(0xFF6C63FF)))
-                        : CameraPreview(controller!),
-                  ),
-
-                  // رسم الهيكل النيوني الأزرق فوق الكاميرا بدقة
-                  if (_latestPose != null && _imageSize != null)
-                    Positioned.fill(
-                      child: CustomPaint(
-                        painter: NeonSkeletonPainter(_latestPose!, _imageSize!),
-                      ),
-                    ),
-
-                  if (_showSuccessFlash)
-                    Container(
-                      decoration: BoxDecoration(
-                        color: Colors.greenAccent.withOpacity(0.3),
-                        borderRadius: BorderRadius.circular(30),
-                      ),
-                    ),
-                  if (_showSuccessFlash)
-                    const Icon(Icons.check_circle_outline, color: Colors.greenAccent, size: 100),
-                ],
-              ),
-            ),
-          ),
-
-          const SizedBox(height: 20),
-
-          Expanded(
-            flex: 4,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 20),
-              decoration: const BoxDecoration(
-                color: Color(0xFF1E1E2C),
-                borderRadius: BorderRadius.only(
-                  topLeft: Radius.circular(40),
-                  topRight: Radius.circular(40),
-                ),
-                boxShadow: [BoxShadow(color: Colors.black45, blurRadius: 15, offset: Offset(0, -5))],
-              ),
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                children: [
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                    children: [
-                      _buildStatCard('سكوات', squatsCount, const Color(0xFF00E676), Icons.accessibility_new_rounded),
-                      _buildStatCard('النقاط', points, Colors.amber, Icons.stars_rounded, isLarge: true),
-                      _buildStatCard('ضغط', pushUpsCount, const Color(0xFFFF1744), Icons.fitness_center_rounded),
-                    ],
-                  ),
-
-                  Container(
-                    padding: const EdgeInsets.all(5),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF2A2A3D),
-                      borderRadius: BorderRadius.circular(20),
-                    ),
-                    child: Row(
-                      mainAxisAlignment: Maincenter,
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        _buildLevelChip('مبتدئ', UserLevel.beginner),
-                        const SizedBox(width: 5),
-                        _buildLevelChip('متوسط', UserLevel.intermediate),
-                        const SizedBox(width: 5),
-                        _buildLevelChip('وحش', UserLevel.advanced),
-                      ],
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          )
         ],
       ),
     );
   }
 
-  Widget _buildStatCard(String title, int value, Color color, IconData icon, {bool isLarge = false}) {
+  Widget _buildTimeCard(double progress, bool isLow) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+      child: AnimatedBuilder(
+        animation: _pulseController,
+        builder: (context, child) {
+          final glowStrength = (isLow || _isAppBlocked) ? _pulseController.value : 0.0;
+          return Container(
+            padding: const EdgeInsets.all(20),
+            decoration: BoxDecoration(
+              color: AppColors.surface,
+              borderRadius: BorderRadius.circular(24),
+              border: Border.all(
+                color: (_isAppBlocked ? AppColors.danger : AppColors.primary)
+                    .withOpacity(0.3 + glowStrength * 0.4),
+                width: 1.5,
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: (_isAppBlocked ? AppColors.danger : AppColors.primary)
+                      .withOpacity(0.15 + glowStrength * 0.15),
+                  blurRadius: 20,
+                  spreadRadius: 1,
+                )
+              ],
+            ),
+            child: child,
+          );
+        },
+        child: Column(
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Row(
+                  children: [
+                    Icon(
+                      _isAppBlocked ? Icons.lock_clock_rounded : Icons.timer_outlined,
+                      color: _isAppBlocked ? AppColors.danger : AppColors.amber,
+                      size: 26,
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      _isAppBlocked ? 'الوقت خلص! مارس تمرين' : 'الرصيد المتاح',
+                      style: const TextStyle(color: Colors.white70, fontSize: 14),
+                    ),
+                  ],
+                ),
+                Text(
+                  '$_allowedScrollTime ث',
+                  style: TextStyle(
+                    fontSize: 26,
+                    fontWeight: FontWeight.w900,
+                    color: _isAppBlocked ? AppColors.danger : Colors.white,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 14),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(15),
+              child: TweenAnimationBuilder<double>(
+                tween: Tween(begin: 0, end: progress.clamp(0.0, 1.0)),
+                duration: const Duration(milliseconds: 400),
+                builder: (context, value, _) => LinearProgressIndicator(
+                  value: value,
+                  minHeight: 12,
+                  backgroundColor: Colors.white12,
+                  valueColor: AlwaysStoppedAnimation<Color>(
+                    _isAppBlocked ? AppColors.danger : AppColors.success,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCameraArea() {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 20),
+      child: ScaleTransition(
+        scale: _repController,
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            Container(
+              width: double.infinity,
+              clipBehavior: Clip.antiAlias,
+              decoration: BoxDecoration(
+                color: Colors.black,
+                borderRadius: BorderRadius.circular(28),
+                border: Border.all(color: AppColors.primary, width: 2.5),
+                boxShadow: const [
+                  BoxShadow(color: Color(0x4D6C63FF), blurRadius: 24, spreadRadius: 2)
+                ],
+              ),
+              child: _buildCameraContent(),
+            ),
+            if (_showSuccessFlash) ...[
+              Container(
+                decoration: BoxDecoration(
+                  color: AppColors.success.withOpacity(0.25),
+                  borderRadius: BorderRadius.circular(28),
+                ),
+              ),
+              const Icon(Icons.check_circle_rounded,
+                  color: AppColors.success, size: 90),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCameraContent() {
+    if (_cameraError != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.videocam_off_rounded, color: Colors.white38, size: 48),
+              const SizedBox(height: 12),
+              Text(_cameraError!,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.white60)),
+              const SizedBox(height: 16),
+              TextButton.icon(
+                onPressed: () {
+                  setState(() => _cameraError = null);
+                  _initializeCamera();
+                },
+                icon: const Icon(Icons.refresh_rounded, color: AppColors.neon),
+                label: const Text('إعادة المحاولة',
+                    style: TextStyle(color: AppColors.neon)),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    if (!_isCameraInitialized || controller == null) {
+      return const Center(
+        child: CircularProgressIndicator(color: AppColors.primary),
+      );
+    }
+
+    // نلف الكاميرا والرسم مع بعض في نفس الـ Transform حتى يفضلوا متزامنين
+    // تماماً في حالة كانت الكاميرا الأمامية (mirrored)، بدل ما يتحسب كل واحد لوحده.
+    return Transform(
+      alignment: Alignment.center,
+      transform: _isFrontCamera ? Matrix4.rotationY(math.pi) : Matrix4.identity(),
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          CameraPreview(controller!),
+          if (_latestPose != null && _imageSize != null)
+            CustomPaint(
+              painter: NeonSkeletonPainter(_latestPose!, _imageSize!),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStatsPanel() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 20),
+      decoration: const BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.only(
+          topLeft: Radius.circular(36),
+          topRight: Radius.circular(36),
+        ),
+        boxShadow: [BoxShadow(color: Colors.black45, blurRadius: 15, offset: Offset(0, -5))],
+      ),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: [
+              _buildStatCard('سكوات', squatsCount, AppColors.success,
+                  Icons.accessibility_new_rounded),
+              _buildStatCard('النقاط', points, AppColors.amber, Icons.stars_rounded,
+                  isLarge: true),
+              _buildStatCard('ضغط', pushUpsCount, AppColors.danger,
+                  Icons.fitness_center_rounded),
+            ],
+          ),
+          Column(
+            children: [
+              const Text('مستوى الصعوبة',
+                  style: TextStyle(color: Colors.white38, fontSize: 12)),
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.all(5),
+                decoration: BoxDecoration(
+                  color: AppColors.surfaceLight,
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    _buildLevelChip('مبتدئ', UserLevel.beginner),
+                    const SizedBox(width: 5),
+                    _buildLevelChip('متوسط', UserLevel.intermediate),
+                    const SizedBox(width: 5),
+                    _buildLevelChip('وحش', UserLevel.advanced),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStatCard(String title, int value, Color color, IconData icon,
+      {bool isLarge = false}) {
     return Container(
       width: isLarge ? 120 : 100,
       padding: EdgeInsets.symmetric(vertical: isLarge ? 18 : 12),
       decoration: BoxDecoration(
-        color: const Color(0xFF2A2A3D),
+        color: AppColors.surfaceLight,
         borderRadius: BorderRadius.circular(20),
         border: Border.all(color: color.withOpacity(0.5), width: 2),
-        boxShadow: [
-          BoxShadow(color: color.withOpacity(0.15), blurRadius: 10, spreadRadius: 1)
-        ]
+        boxShadow: [BoxShadow(color: color.withOpacity(0.15), blurRadius: 10, spreadRadius: 1)],
       ),
       child: Column(
         children: [
           Icon(icon, color: color, size: isLarge ? 35 : 28),
           const SizedBox(height: 8),
-          Text(title, style: TextStyle(color: Colors.white70, fontSize: isLarge ? 16 : 14, fontWeight: FontWeight.bold)),
-          Text('$value', style: TextStyle(color: color, fontSize: isLarge ? 28 : 24, fontWeight: FontWeight.w900)),
+          Text(title,
+              style: TextStyle(
+                  color: Colors.white70,
+                  fontSize: isLarge ? 16 : 14,
+                  fontWeight: FontWeight.bold)),
+          Text('$value',
+              style: TextStyle(
+                  color: color, fontSize: isLarge ? 28 : 24, fontWeight: FontWeight.w900)),
         ],
       ),
     );
@@ -548,7 +829,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
           _saveData();
         }
       },
-      selectedColor: const Color(0xFF6C63FF),
+      selectedColor: AppColors.primary,
       backgroundColor: Colors.transparent,
       labelStyle: TextStyle(color: isSelected ? Colors.white : Colors.white60),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
@@ -556,15 +837,18 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     );
   }
 
-  InputImage? _inputImageFromCameraImage(CameraImage image) {
-    if (controller == null) return null;
-    final camera = controller!.description;
+  /// يبني الـ InputImage للـ ML Kit، ويرجع معه أبعاد الصورة الصحيحة
+  /// بعد مراعاة التدوير (rotation) عشان نستخدمها في الـ scaling الخاص بالرسام.
+  _InputImageResult? _inputImageFromCameraImage(CameraImage image) {
+    final cam = controller;
+    if (cam == null) return null;
+    final camera = cam.description;
 
     InputImageRotation? rotation;
     if (Platform.isIOS) {
       rotation = InputImageRotationValue.fromRawValue(camera.sensorOrientation);
     } else if (Platform.isAndroid) {
-      var rotationCompensation = _orientations[controller!.value.deviceOrientation];
+      var rotationCompensation = _orientations[cam.value.deviceOrientation];
       if (rotationCompensation == null) return null;
       if (camera.lensDirection == CameraLensDirection.front) {
         rotationCompensation = (camera.sensorOrientation + rotationCompensation) % 360;
@@ -583,69 +867,130 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     }
     final bytes = allBytes.done().buffer.asUint8List();
 
-    return InputImage.fromBytes(
+    final rawSize = Size(image.width.toDouble(), image.height.toDouble());
+
+    final inputImage = InputImage.fromBytes(
       bytes: bytes,
       metadata: InputImageMetadata(
-        size: Size(image.width.toDouble(), image.height.toDouble()),
+        size: rawSize,
         rotation: rotation,
         format: format,
         bytesPerRow: image.planes[0].bytesPerRow,
       ),
     );
+
+    // لما التدوير 90 أو 270 درجة، الصورة الفعلية (upright) بتكون العرض
+    // والارتفاع معكوسين عن raw sensor size -- ده اللي بيخلي الهيكل يتشوه
+    // لو استخدمنا image.width/height مباشرة بدون تعديل.
+    final isRotated90or270 =
+        rotation == InputImageRotation.rotation90deg ||
+        rotation == InputImageRotation.rotation270deg;
+    final adjustedSize =
+        isRotated90or270 ? Size(rawSize.height, rawSize.width) : rawSize;
+
+    return _InputImageResult(inputImage: inputImage, adjustedSize: adjustedSize);
   }
 }
 
-// رسام النيون الأزرق المدمج مع كود كلود
+class _InputImageResult {
+  final InputImage inputImage;
+  final Size adjustedSize;
+  const _InputImageResult({required this.inputImage, required this.adjustedSize});
+}
+
+/// رسام الهيكل النيوني الأزرق فوق الكاميرا، مع Scaling ديناميكي
+/// بناءً على حجم الصورة الفعلي (بعد مراعاة التدوير) لضمان عدم تشوه الخطوط.
 class NeonSkeletonPainter extends CustomPainter {
   final Pose pose;
   final Size imageSize;
+  static const double _minLikelihoodToDraw = 0.5;
 
   NeonSkeletonPainter(this.pose, this.imageSize);
 
   @override
   void paint(Canvas canvas, Size size) {
-    final paint = Paint()
-      ..color = const Color(0xff00f0ff) // أزرق نيون مشع
+    if (imageSize.width == 0 || imageSize.height == 0) return;
+
+    final linePaint = Paint()
+      ..color = const Color(0xff00f0ff)
       ..strokeWidth = 4.0
       ..strokeCap = StrokeCap.round
       ..style = PaintingStyle.stroke;
 
     final glowPaint = Paint()
-      ..color = const Color(0xff00f0ff).withOpacity(0.3) // تأثير توهج نيون
+      ..color = const Color(0xff00f0ff).withOpacity(0.3)
       ..strokeWidth = 10.0
       ..strokeCap = StrokeCap.round
       ..style = PaintingStyle.stroke;
 
-    void drawNeonLine(PoseLandmarkType startType, PoseLandmarkType endType) {
-      final startLandmark = pose.landmarks[startType];
-      final endLandmark = pose.landmarks[endType];
+    final dotPaint = Paint()
+      ..color = Colors.white
+      ..style = PaintingStyle.fill;
 
-      if (startLandmark != null && endLandmark != null) {
-        // حساب الـ scale ديناميكياً بناءً على حجم الكاميرا الفعلي لعدم تشوه الخطوط
-        final scaleX = size.width / imageSize.width;
-        final scaleY = size.height / imageSize.height;
+    final dotGlowPaint = Paint()
+      ..color = const Color(0xff00f0ff).withOpacity(0.5)
+      ..style = PaintingStyle.fill;
 
-        final start = Offset(startLandmark.x * scaleX, startLandmark.y * scaleY);
-        final end = Offset(endLandmark.x * scaleX, endLandmark.y * scaleY);
+    final scaleX = size.width / imageSize.width;
+    final scaleY = size.height / imageSize.height;
 
-        canvas.drawLine(start, end, glowPaint);
-        canvas.drawLine(start, end, paint);
-      }
+    Offset? toOffset(PoseLandmarkType type) {
+      final lm = pose.landmarks[type];
+      if (lm == null || lm.likelihood < _minLikelihoodToDraw) return null;
+      return Offset(lm.x * scaleX, lm.y * scaleY);
     }
 
-    // رسم مفاصل الذراع الأيسر والأيمن لتمارين الضغط والسكوات
+    void drawNeonLine(PoseLandmarkType startType, PoseLandmarkType endType) {
+      final start = toOffset(startType);
+      final end = toOffset(endType);
+      if (start == null || end == null) return;
+      canvas.drawLine(start, end, glowPaint);
+      canvas.drawLine(start, end, linePaint);
+    }
+
+    void drawJoint(PoseLandmarkType type) {
+      final p = toOffset(type);
+      if (p == null) return;
+      canvas.drawCircle(p, 7, dotGlowPaint);
+      canvas.drawCircle(p, 3, dotPaint);
+    }
+
+    // مفاصل الذراعين (للضغط)
     drawNeonLine(PoseLandmarkType.leftShoulder, PoseLandmarkType.leftElbow);
     drawNeonLine(PoseLandmarkType.leftElbow, PoseLandmarkType.leftWrist);
     drawNeonLine(PoseLandmarkType.rightShoulder, PoseLandmarkType.rightElbow);
     drawNeonLine(PoseLandmarkType.rightElbow, PoseLandmarkType.rightWrist);
-    
-    // رسم مفاصل الأرجل للسكوات
+
+    // مفاصل الأرجل (للسكوات)
     drawNeonLine(PoseLandmarkType.leftHip, PoseLandmarkType.leftKnee);
     drawNeonLine(PoseLandmarkType.leftKnee, PoseLandmarkType.leftAnkle);
     drawNeonLine(PoseLandmarkType.rightHip, PoseLandmarkType.rightKnee);
     drawNeonLine(PoseLandmarkType.rightKnee, PoseLandmarkType.rightAnkle);
+
+    // خط الوسط يربط الجزء العلوي بالسفلي بصرياً
+    drawNeonLine(PoseLandmarkType.leftShoulder, PoseLandmarkType.leftHip);
+    drawNeonLine(PoseLandmarkType.rightShoulder, PoseLandmarkType.rightHip);
+
+    for (final type in [
+      PoseLandmarkType.leftShoulder,
+      PoseLandmarkType.rightShoulder,
+      PoseLandmarkType.leftElbow,
+      PoseLandmarkType.rightElbow,
+      PoseLandmarkType.leftWrist,
+      PoseLandmarkType.rightWrist,
+      PoseLandmarkType.leftHip,
+      PoseLandmarkType.rightHip,
+      PoseLandmarkType.leftKnee,
+      PoseLandmarkType.rightKnee,
+      PoseLandmarkType.leftAnkle,
+      PoseLandmarkType.rightAnkle,
+    ]) {
+      drawJoint(type);
+    }
   }
 
   @override
-  bool shouldRepaint(covariant NeonSkeletonPainter oldDelegate) => true;
+  bool shouldRepaint(covariant NeonSkeletonPainter oldDelegate) {
+    return oldDelegate.pose != pose || oldDelegate.imageSize != imageSize;
+  }
 }
